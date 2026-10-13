@@ -25,8 +25,9 @@ All figures measured at `N = 32`, `Ψ = 399,370` parameters, mixed-precision Ada
 | **vs baseline** | 1.00x | 3.66x less | 6.56x less | **32.00x less** |
 | Peak (incl. transients) | 6.658 MB | 2.230 MB | 1.493 MB | 1.256 MB |
 | **Communication / step** | 1.94x | 1.94x | 1.94x | **2.91x** |
-| **FLOPs / GPU / step** | 76.5 M | 76.5 M | 76.5 M | 76.5 M |
-| Final loss | 0.371883 | 0.371883 | 0.371883 | 0.371883 |
+| **Matmul FLOPs / GPU / step** | 76.5 M | 76.5 M | 76.5 M | 76.5 M |
+| **Adam updates / GPU / step** | 399,392 | 12,481 | 12,481 | **12,481 (32x less)** |
+| Final loss | 0.371121 | 0.371121 | 0.371121 | 0.371121 |
 
 Communication is expressed as a multiple of the fp16 model size. The values land at `1.94x`/`2.91x`
 rather than `2x`/`3x` because a ring collective moves `(N-1)/N` of the payload, and `31/32 = 0.969`.
@@ -162,11 +163,23 @@ less memory. There is no reason not to enable them.
 **ZeRO-3 is the only stage that pays: +50% traffic for 32x less memory.** In a real cluster much of
 that gather is hidden behind compute by prefetching layer `i+1` while layer `i` runs.
 
-## Computation: unchanged, and that is the point
+## Computation: the model's arithmetic is unchanged, the optimizer step shrinks by N
 
-FLOPs per GPU are **identical across all four configurations** (76.5 MFLOP/step here — the notebook
-asserts it). Every rank still performs a full forward and backward over its own micro-batch, and
-nothing is recomputed. ZeRO redistributes *state*, not arithmetic.
+Matmul FLOPs per GPU are **identical across all four configurations** (76.5 MFLOP/step here — the
+notebook asserts it). Every rank still performs a full forward and backward over its own micro-batch,
+and nothing is recomputed. ZeRO redistributes *state*, not the model's arithmetic.
+
+The one piece of arithmetic that does change is the **optimizer step**. Under plain data parallelism
+every rank runs Adam over all `Ψ` parameters, so 32 GPUs compute the same update 32 times. From ZeRO-1
+on, each rank updates only the `Ψ/N` shard whose optimizer state it owns:
+
+| | Adam updates / GPU / step | across all 32 GPUs |
+|---|---|---|
+| Baseline DP | 399,392 (`Ψ`) | 12,780,544 — 32 redundant copies |
+| ZeRO-1 / 2 / 3 | 12,481 (`Ψ/N`) | 399,392 — each parameter updated once |
+
+Adam is elementwise (`O(Ψ)`) and small next to the `6·B·Ψ` of forward+backward, so this is a bonus
+rather than the headline, but it is measured and asserted, not assumed.
 
 This is exactly what separates ZeRO from tensor/model parallelism, which *does* split the arithmetic
 and therefore needs high-bandwidth intra-node interconnect to be viable. ZeRO's communication is
@@ -242,7 +255,7 @@ GB per GPU at `N = 32`, model states only (activations extra), against an 80 GB 
 
 ## Correctness: why you should believe the memory numbers
 
-A memory simulation that does not train correctly is just a spreadsheet. Three assertions in the
+A memory simulation that does not train correctly is just a spreadsheet. Four assertions in the
 notebook keep it honest, and the notebook fails to execute if any of them breaks:
 
 1. **Bitwise equivalence.** All four configurations, from the same seed on the same data, produce
@@ -252,6 +265,8 @@ notebook keep it honest, and the notebook fails to execute if any of them breaks
    the paper's `16Ψ` / `4Ψ+12Ψ/N` / `2Ψ+14Ψ/N` / `16Ψ/N` — exactly, to the byte.
 3. **FLOPs are invariant.** Asserted identical across stages, so a stage cannot secretly buy memory
    with recomputation.
+4. **Optimizer work is sharded.** Each GPU's Adam step is asserted to touch exactly `Ψ` elements
+   (baseline) or `Ψ/N` (every ZeRO stage).
 
 ```
 max |loss - baseline|        ZeRO-1 (Pos) : 0.000e+00
